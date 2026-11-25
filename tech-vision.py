@@ -223,13 +223,20 @@ def draw_face(frame, face) -> None:
     )
 
 
-def draw_hud(frame, fps: float, face_count: int, mirrored: bool, engine: str) -> None:
+def draw_hud(
+    frame,
+    fps: float,
+    face_count: int,
+    max_faces: int,
+    mirrored: bool,
+    engine: str,
+) -> None:
     """Отображает служебную информацию в углу кадра."""
     h, _ = frame.shape[:2]
     lines = [
         f"Engine: {engine}",
         f"FPS: {fps:5.1f}",
-        f"Faces: {face_count}",
+        f"Faces: {face_count} / max {max_faces}",
         f"Mirror: {'on' if mirrored else 'off'}",
         "q/Esc - exit, s - snapshot, m - mirror",
     ]
@@ -254,6 +261,82 @@ def save_snapshot(frame) -> str:
     path = os.path.join(SNAPSHOT_DIR, filename)
     cv2.imwrite(path, frame)
     return path
+
+
+def ask_max_faces(default: int = 1):
+    """Окно выбора допустимого числа лиц перед запуском.
+
+    Возвращает выбранное число или None, если пользователь отменил запуск.
+    Если tkinter недоступен, возвращает значение по умолчанию.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import ttk
+    except ImportError:
+        print("tkinter недоступен — используется значение по умолчанию.")
+        return default
+
+    result = {"value": None}
+
+    root = tk.Tk()
+    root.title("Tech Vision — настройки")
+    root.resizable(False, False)
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+
+    frame = ttk.Frame(root, padding=16)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(
+        frame,
+        text="Сколько лиц допускается в кадре?",
+        font=("Segoe UI", 11, "bold"),
+    ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+    ttk.Label(
+        frame,
+        text=(
+            "Если лиц станет больше, сработает тревога:\n"
+            "предупреждение на экране, звуковой сигнал\n"
+            "и сворачивание всех окон (Win+D)."
+        ),
+        justify="left",
+    ).grid(row=1, column=0, sticky="w", pady=(0, 10))
+
+    var = tk.IntVar(value=max(1, int(default)))
+    spin = ttk.Spinbox(
+        frame, from_=1, to=10, textvariable=var, width=6,
+        font=("Segoe UI", 11),
+    )
+    spin.grid(row=2, column=0, sticky="w", pady=(0, 12))
+
+    def on_start(*_args):
+        try:
+            value = int(var.get())
+        except (tk.TclError, ValueError):
+            value = max(1, int(default))
+        result["value"] = max(1, value)
+        root.destroy()
+
+    def on_cancel(*_args):
+        root.destroy()
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=3, column=0, sticky="ew")
+    ttk.Button(buttons, text="Запустить", command=on_start).pack(side="left")
+    ttk.Button(buttons, text="Отмена", command=on_cancel).pack(
+        side="left", padx=(8, 0)
+    )
+
+    root.bind("<Return>", on_start)
+    root.bind("<Escape>", on_cancel)
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    spin.focus_set()
+
+    root.mainloop()
+    return result["value"]
 
 
 def play_alert_sound() -> None:
@@ -292,13 +375,40 @@ def minimize_all_windows() -> bool:
         return False
 
 
-def draw_alert_banner(frame, face_count: int) -> None:
+def find_window_handle(title: str):
+    """Возвращает HWND окна по заголовку (только Windows)."""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = ctypes.c_void_p
+        user32.FindWindowW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        hwnd = user32.FindWindowW(None, title)
+        return hwnd or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def is_window_minimized(hwnd) -> bool:
+    """Проверяет, свёрнуто ли окно с данным HWND (только Windows)."""
+    if not hwnd or os.name != "nt":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.IsIconic.restype = ctypes.c_bool
+        user32.IsIconic.argtypes = [ctypes.c_void_p]
+        return bool(user32.IsIconic(hwnd))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def draw_alert_banner(frame, face_count: int, max_faces: int) -> None:
     """Рисует мигающее красное предупреждение о лишних лицах в кадре."""
     if int(time.time() * 3) % 2 == 0:
         return  # мигание: показываем через такт
 
     h, w = frame.shape[:2]
-    text = f"WARNING: MORE THAN ONE FACE! ({face_count})"
+    text = f"WARNING: MORE THAN {max_faces} FACE(S)! ({face_count})"
     scale, thickness = 0.9, 2
     (text_w, text_h), baseline = cv2.getTextSize(
         text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
@@ -328,6 +438,13 @@ def draw_alert_banner(frame, face_count: int) -> None:
 # Основной цикл
 # ---------------------------------------------------------------------------
 def main() -> int:
+    # Перед запуском спрашиваем допустимое число лиц
+    max_faces = ask_max_faces(MAX_ALLOWED_FACES)
+    if max_faces is None:
+        print("Запуск отменён пользователем.")
+        return 0
+    print(f"Допустимое число лиц в кадре: {max_faces}")
+
     try:
         detector, engine = build_detector()
         cap = open_camera(CAMERA_INDEX)
@@ -340,6 +457,12 @@ def main() -> int:
     fps = 0.0
     last_saved = ""
     last_alert = 0.0
+    # Win+D — переключатель: повторный вызов развернул бы окна обратно.
+    # Флаг сбрасывается, когда пользователь сам разворачивает окно программы.
+    windows_minimized = False
+    minimize_time = 0.0
+    minimize_confirmed = False   # убедились, что окно действительно свёрнуто
+    cv_hwnd = None               # HWND окна OpenCV (ищем после первого imshow)
 
     print(f"Детектор: {engine}")
     print("Камера запущена. Нажмите 'q' или Esc для выхода.")
@@ -364,21 +487,56 @@ def main() -> int:
             fps = instant_fps if fps == 0 else fps * 0.9 + instant_fps * 0.1
             prev_time = now
 
+            # Если окна были свёрнуты, проверяем, не развернул ли их пользователь.
+            # Пока окно свёрнуто, повторный Win+D не отправляем.
+            if windows_minimized:
+                if cv_hwnd is None:
+                    cv_hwnd = find_window_handle(WINDOW_NAME)
+                if cv_hwnd is not None:
+                    if not minimize_confirmed:
+                        # Ждём, пока Win+D реально свернёт окно
+                        if is_window_minimized(cv_hwnd):
+                            minimize_confirmed = True
+                        elif now - minimize_time > 1.5:
+                            # Win+D не сработал — разрешаем попытку снова
+                            windows_minimized = False
+                    elif not is_window_minimized(cv_hwnd):
+                        # Пользователь вручную развернул окно программы
+                        windows_minimized = False
+                        minimize_confirmed = False
+                        print(
+                            "Окно восстановлено — автосворачивание снова активно.",
+                            file=sys.stderr,
+                        )
+
             # Тревога: в кадре больше разрешённого числа лиц
-            if len(faces) > MAX_ALLOWED_FACES:
-                draw_alert_banner(frame, len(faces))
+            if len(faces) > max_faces:
+                draw_alert_banner(frame, len(faces), max_faces)
+
+                # Сворачиваем только если окна ещё не свёрнуты: повторный
+                # Win+D развернул бы их обратно. Проверка вынесена из блока
+                # со звуком, чтобы после ручного восстановления окна
+                # сворачивание срабатывало сразу, не дожидаясь кулдауна.
+                if (
+                    MINIMIZE_ON_ALERT
+                    and not windows_minimized
+                    and minimize_all_windows()
+                ):
+                    windows_minimized = True
+                    minimize_confirmed = False
+                    minimize_time = now
+                    print("Все окна свёрнуты (Win+D).", file=sys.stderr)
+
                 if now - last_alert >= ALERT_COOLDOWN:
                     last_alert = now
                     play_alert_sound()
                     print(
-                        f"ВНИМАНИЕ: обнаружено больше одного лица "
-                        f"({len(faces)})!",
+                        f"ВНИМАНИЕ: в кадре {len(faces)} лиц(а), "
+                        f"а допустимо {max_faces}!",
                         file=sys.stderr,
                     )
-                    if MINIMIZE_ON_ALERT and minimize_all_windows():
-                        print("Все окна свёрнуты (Win+D).", file=sys.stderr)
 
-            draw_hud(frame, fps, len(faces), mirrored, engine)
+            draw_hud(frame, fps, len(faces), max_faces, mirrored, engine)
 
             if last_saved:
                 cv2.putText(
