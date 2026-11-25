@@ -20,13 +20,27 @@
     m        — переключить зеркальный режим
 """
 
+import ctypes
 import os
 import sys
 import time
 import urllib.request
 from datetime import datetime
 
+# Убираем служебные предупреждения OpenCV (должно быть до import cv2)
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
+
 import cv2
+
+try:
+    cv2.setLogLevel(0)
+except (AttributeError, cv2.error):
+    pass
+
+try:  # звуковой сигнал на Windows
+    import winsound
+except ImportError:  # другие ОС — используем системный "звонок" терминала
+    winsound = None
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +63,11 @@ YUNET_URL = (
 SCORE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.3
 TOP_K = 5000
+
+# Тревога: если лиц в кадре больше этого числа — предупреждение и звук
+MAX_ALLOWED_FACES = 1
+ALERT_COOLDOWN = 2.0        # минимальный интервал между сигналами, сек
+MINIMIZE_ON_ALERT = True    # сворачивать все окна (Win+D) при тревоге
 
 # Резервный вариант для OpenCV 4.x — каскад Хаара
 HAAR_FILENAME = "haarcascade_frontalface_default.xml"
@@ -237,6 +256,74 @@ def save_snapshot(frame) -> str:
     return path
 
 
+def play_alert_sound() -> None:
+    """Проигрывает короткий звуковой сигнал тревоги (не блокирует цикл)."""
+    if winsound is not None:
+        try:
+            winsound.PlaySound(
+                "SystemHand", winsound.SND_ALIAS | winsound.SND_ASYNC
+            )
+            return
+        except RuntimeError:
+            try:
+                winsound.Beep(1000, 300)
+                return
+            except RuntimeError:
+                pass
+    # Запасной вариант — системный "звонок" терминала
+    sys.stdout.write("\a")
+    sys.stdout.flush()
+
+
+def minimize_all_windows() -> bool:
+    """Сворачивает все окна сочетанием Win+D (только Windows)."""
+    if os.name != "nt":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        vk_lwin, vk_d, keyeventf_keyup = 0x5B, 0x44, 0x0002
+        # Эмулируем нажатие Win+D
+        user32.keybd_event(vk_lwin, 0, 0, 0)
+        user32.keybd_event(vk_d, 0, 0, 0)
+        user32.keybd_event(vk_d, 0, keyeventf_keyup, 0)
+        user32.keybd_event(vk_lwin, 0, keyeventf_keyup, 0)
+        return True
+    except Exception:  # noqa: BLE001 - сворачивание не должно ломать цикл
+        return False
+
+
+def draw_alert_banner(frame, face_count: int) -> None:
+    """Рисует мигающее красное предупреждение о лишних лицах в кадре."""
+    if int(time.time() * 3) % 2 == 0:
+        return  # мигание: показываем через такт
+
+    h, w = frame.shape[:2]
+    text = f"WARNING: MORE THAN ONE FACE! ({face_count})"
+    scale, thickness = 0.9, 2
+    (text_w, text_h), baseline = cv2.getTextSize(
+        text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+    )
+    x = max((w - text_w) // 2, 0)
+    y = 20
+    cv2.rectangle(
+        frame,
+        (x - 10, y),
+        (x + text_w + 10, y + text_h + baseline + 10),
+        (0, 0, 255),
+        cv2.FILLED,
+    )
+    cv2.putText(
+        frame,
+        text,
+        (x, y + text_h + 4),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Основной цикл
 # ---------------------------------------------------------------------------
@@ -252,6 +339,7 @@ def main() -> int:
     prev_time = time.perf_counter()
     fps = 0.0
     last_saved = ""
+    last_alert = 0.0
 
     print(f"Детектор: {engine}")
     print("Камера запущена. Нажмите 'q' или Esc для выхода.")
@@ -275,6 +363,20 @@ def main() -> int:
             instant_fps = 1.0 / max(now - prev_time, 1e-6)
             fps = instant_fps if fps == 0 else fps * 0.9 + instant_fps * 0.1
             prev_time = now
+
+            # Тревога: в кадре больше разрешённого числа лиц
+            if len(faces) > MAX_ALLOWED_FACES:
+                draw_alert_banner(frame, len(faces))
+                if now - last_alert >= ALERT_COOLDOWN:
+                    last_alert = now
+                    play_alert_sound()
+                    print(
+                        f"ВНИМАНИЕ: обнаружено больше одного лица "
+                        f"({len(faces)})!",
+                        file=sys.stderr,
+                    )
+                    if MINIMIZE_ON_ALERT and minimize_all_windows():
+                        print("Все окна свёрнуты (Win+D).", file=sys.stderr)
 
             draw_hud(frame, fps, len(faces), mirrored, engine)
 
